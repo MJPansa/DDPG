@@ -30,7 +30,7 @@ class DDPGExperienceBuffer:
 
     @property
     def threshold(self):
-        return True if self.threshold_v > self.__len__() / self.size else False
+        return True if (self.threshold_v < len(self.states) / self.size) else False
 
     def __len__(self):
         return len(self.states)

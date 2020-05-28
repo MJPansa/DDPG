@@ -3,10 +3,7 @@ import torch as T
 from models import DDPGActor, DDPGCritic
 from utils import DDPGExperienceBuffer
 from torch.nn.utils.clip_grad import clip_grad_norm_
-import torch.nn.functional as F
-from torch.distributions import Normal
 import wandb
-import sys
 import gym
 
 wandb.init(project="actor_critic_continuous")
@@ -15,24 +12,24 @@ env = gym.make('LunarLanderContinuous-v2')
 
 args = {'obs_space': 8,
         'action_space': 2,
-        'n_hidden': 300,
-        'bs': 256,
+        'n_hidden': 256,
+        'bs': 64,
         'lr_actor': 1e-4,
         'lr_critic': 1e-3,
         'device': 'cuda:0',
-        'gamma': .999,
-        'noise_factor': 0.01,
+        'gamma': .95,
+        'noise_factor': 0.1,
         'noise_decay': 0.999,
-        'buffer_size': 1_000_000,
+        'buffer_size': 50_000,
         'critic_weight': .5,
         'episodes': 5000,
-        'clipping': 2.,
-        'buffer_threshold': .05,
-        'train_every_n': 1,
-        'model_update_every_n': 1,
+        'clipping': 1.,
+        'buffer_threshold': .15,
+        'train_every_n': 2,
+        'model_update_every_n': 4,
         'tau': 0.01,
-        'clip_grad': 0.1,
-        'exploration_steps': 10000
+        'clip_grad': 1.,
+        'exploration_steps': 5000
         }
 
 print(args)
@@ -46,8 +43,6 @@ critic_target.load_state_dict(critic.state_dict())
 
 exp = DDPGExperienceBuffer(args['buffer_size'], args['bs'], args['buffer_threshold'], args['device'])
 
-wandb.watch(actor)
-wandb.watch(critic)
 step = 0
 for episode in range(args['episodes']):
 
@@ -63,15 +58,11 @@ for episode in range(args['episodes']):
     while not done:
         actor.eval()
         exp_cache.append(T.Tensor(state))
-        # print(state.shape)
         if step < args['exploration_steps']:
             action = np.random.uniform(-1, 1, size=2)
         else:
             action = actor(state)
-            # print(actions.size())
-
             action = action.squeeze().detach().cpu().numpy()
-
             noise = np.random.randn(args['action_space']) * args['noise_factor']
             action = np.clip(action + noise, -1., 1.)
         exp_cache.append(T.Tensor(action))
@@ -79,7 +70,6 @@ for episode in range(args['episodes']):
         next_state, reward, done, _ = env.step(action)
 
         stats['rewards'] += reward
-        args['noise_factor'] *= args['noise_decay']
         step += 1
 
         exp_cache.append(T.Tensor([reward]))
@@ -90,45 +80,40 @@ for episode in range(args['episodes']):
 
         state = next_state.copy()
 
-    if exp.threshold:
-        actor.train()
-        critic.train()
-        critic_target.train()
-        actor_target.train()
+        if exp.threshold and (step % 1 == 0):
 
-        o, a, r, d, o2 = exp.draw()
+            o, a, r, d, o2 = exp.draw()
+            q = critic(o, a)
+            q_target = critic_target(o2, actor_target(o2))
+            q_target = r + args['gamma'] * q_target * (1 - d)
+            critic_loss = ((q - q_target.detach()) ** 2).mean()
 
-        q = critic(o, a)
+            critic.optimizer.zero_grad()
+            critic_loss.backward()
+            clip_grad_norm_(critic.parameters(), args['clip_grad'])
+            critic.optimizer.step()
 
-        q_target = critic_target(o2, actor_target(o2))
-        q_target = r + args['gamma'] * q_target * (1 - d)
+            a_ = actor(o)
+            actor_loss = -1 * critic(o, a_).mean()
 
-        critic_loss = ((q - q_target.detach()) ** 2).mean()
+            actor.optimizer.zero_grad()
+            actor_loss.backward()
+            clip_grad_norm_(actor.parameters(), args['clip_grad'])
+            actor.optimizer.step()
 
-        critic.optimizer.zero_grad()
-        critic_loss.backward()
-        clip_grad_norm_(critic.parameters(), args['clip_grad'])
-        critic.optimizer.step()
+            stats['actor_loss'] += actor_loss
+            stats['critic_loss'] += critic_loss
+            stats['loss'] += (actor_loss + critic_loss)
 
-        a_ = actor(o)
-        actor_loss = -1 * critic(o, a_).mean()
+            args['noise_factor'] *= args['noise_decay']
 
-        actor.optimizer.zero_grad()
-        actor_loss.backward()
-        clip_grad_norm_(actor.parameters(), args['clip_grad'])
-        actor.optimizer.step()
+            if step % args['model_update_every_n'] == 0:
 
-        stats['actor_loss'] += actor_loss
-        stats['critic_loss'] += critic_loss
-        stats['loss'] += (actor_loss + critic_loss)
+                for target_param, local_param in zip(actor_target.parameters(), actor.parameters()):
+                    target_param.data.copy_(args['tau'] * local_param.data + (1.0 - args['tau']) * target_param.data)
 
-        # if step % args['model_update_every_n'] == 0:
-
-        for target_param, local_param in zip(actor_target.parameters(), actor.parameters()):
-            target_param.data.copy_(args['tau'] * local_param.data + (1.0 - args['tau']) * target_param.data)
-
-        for target_param, local_param in zip(critic_target.parameters(), critic.parameters()):
-            target_param.data.copy_(args['tau'] * local_param.data + (1.0 - args['tau']) * target_param.data)
+                for target_param, local_param in zip(critic_target.parameters(), critic.parameters()):
+                    target_param.data.copy_(args['tau'] * local_param.data + (1.0 - args['tau']) * target_param.data)
 
     print(f'episode {episode}:')
     print(f'rewards: {stats["rewards"]:.5f}')
